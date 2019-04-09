@@ -28,6 +28,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from typing import Union, Optional, List, Dict, Tuple
+
 import gphoto2 as gp
 
 
@@ -37,24 +39,26 @@ class PBCamera:
     out
     2. A streaming socket which constantly outputs an MJPEG preview from the camera
     """
-    def __init__(self):
-        self.preview_socket = None
+    def __init__(self, control_sock_name="control.sock") -> None:
         self.preview_thread = None
 
-        self.control_socket = None
+        self.control_sock_name = control_sock_name
+        self.control_sock = None
         self.control_thread = None
 
         self.io_lock = threading.Lock()
 
-    def open(self, preview_file="./preview.sock"):
+    def open(self):
         """ Open the preview and control sockets
         """
-        # Make sure the socket does not already exist
         try:
-            os.unlink(preview_file)
+            os.unlink(self.control_sock_name)
         except OSError:
-            if os.path.exists(preview_file):
+            if os.path.exists(self.control_sock_name):
                 raise
+
+        self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.control_sock.bind(self.control_sock_name)
 
         self.camera = gp.Camera()
         self.camera.init()
@@ -71,16 +75,14 @@ class PBCamera:
         else:
             print('No camera model info')
 
-        # Open the socket for video preview
-        self.preview_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.preview_socket.bind(preview_file)
 
-    def close(self):
+
+    def close(self) -> None:
         """ Close all sockets and shut down
         """
         pass
 
-    def _capture_image(self):
+    def _capture_image(self) -> None:
         with self.io_lock:
             print("Taking image")
             file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
@@ -91,15 +93,43 @@ class PBCamera:
             camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
             gp.check_result(gp.gp_file_save(camera_file, target))
 
-    def _capture_preview(self):
+    def _capture_preview(self) -> bytes:
         with self.io_lock:
             camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
             file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
             file_bytes = memoryview(file_data)
         return file_bytes
 
-    def _preview_thread_action_http_mjpeg(self):
-        """ Send data via an HTTP server. Not used currently
+    def _preview_thread_action(self) -> None:
+        return
+
+    def _control_thread_action(self) -> None:
+        while True:
+            data, addr = self.control_sock.recvfrom(1048576)
+            if data:
+                self._capture_image()
+            time.sleep(0.01)
+
+    def run(self) -> None:
+        """ Begin previewing and listening for commands
+        """
+        self.preview_thread = threading.Thread(target=self._preview_thread_action)
+        self.control_thread = threading.Thread(target=self._control_thread_action)
+
+        self.preview_thread.start()
+        self.control_thread.start()
+
+        # Thing runs
+
+        self.preview_thread.join()
+        self.control_thread.join()
+
+class HTTPPBCamera(PBCamera):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def _preview_thread_action(self) -> None:
+        """ Send data via an HTTP server
         """
         camera_self = self
         class PreviewHandler(BaseHTTPRequestHandler):
@@ -125,9 +155,26 @@ class PBCamera:
         server.serve_forever()
         return
 
-    def _preview_thread_action_mjpeg_stream(self):
-        """ Send data as MJPEG stream. Not used currently
+class DomainStreamPBCamera(PBCamera):
+    def __init__(self, preview_file:str="./preview.sock") -> None:
+        self.preview_file = preview_file
+        self.preview_socket:Optional[socket.socket] = None
+        super().__init__()
+
+    def _preview_thread_action(self) -> None:
+        """ Send data as MJPEG stream
         """
+        # Make sure the socket does not already exist
+        try:
+            os.unlink(self.preview_file)
+        except OSError:
+            if os.path.exists(self.preview_file):
+                raise
+
+        # Open the socket for video preview
+        self.preview_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.preview_socket.bind(self.preview_file)
+
         self.preview_socket.listen(1)
         while True:
             connection, client_address = self.preview_socket.accept()
@@ -136,49 +183,36 @@ class PBCamera:
                 with self.io_lock:
                     camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
                     file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
-                    file_bytes = memoryview(file_data)
+                    file_bytes = bytes(memoryview(file_data))
                 try:
                     connection.sendall(file_bytes)
                 except BrokenPipeError:
                     print("Connection closed")
                     break
 
-    def _preview_thread_action(self):
+class DomainDGramPBCamera(PBCamera):
+    def __init__(self, preview_file:str="./preview.sock") -> None:
+        self.preview_socket:Optional[socket.socket] = None
+        self.preview_file:str = preview_file
+        super().__init__()
+
+    def _preview_thread_action(self) -> None:
         """ Send data as a sequence of JPEG datagrams
         """
-        self.out_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.out_socket.bind("")
+        self.preview_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.preview_socket.bind("")
         while True:
             image = self._capture_preview()
             try:
-                self.out_socket.sendto(image, "preview_dgram.sock")
+                self.preview_socket.sendto(image, self.preview_file)
             except ConnectionRefusedError:
                 pass
             time.sleep(0.05)
 
-    def _control_thread_action(self):
-        while True:
-            time.sleep(10)
-            #self._capture_image()
-
-    def run(self):
-        """ Begin previewing and listening for commands
-        """
-        self.preview_thread = threading.Thread(target=self._preview_thread_action)
-        self.control_thread = threading.Thread(target=self._control_thread_action)
-
-        self.preview_thread.start()
-        self.control_thread.start()
-
-        # Thing runs
-
-        self.preview_thread.join()
-        self.control_thread.join()
-
-def exec_server():
+def exec_server() -> None:
     """ Run the server
     """
-    camera = PBCamera()
+    camera = DomainDGramPBCamera()
     camera.open()
     camera.run()
 
