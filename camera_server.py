@@ -39,12 +39,14 @@ class PBCamera:
     out
     2. A streaming socket which constantly outputs an MJPEG preview from the camera
     """
-    def __init__(self, control_sock_name="control.sock") -> None:
+    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock") -> None:
         self.preview_thread = None
 
         self.control_sock_name = control_sock_name
         self.control_sock = None
         self.control_thread = None
+
+        self.capture_sock_name = capture_sock_name
 
         self.io_lock = threading.Lock()
 
@@ -91,7 +93,11 @@ class PBCamera:
             target = os.path.join('/tmp', file_path.name)
             print('Copying image to', target)
             camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
+            if os.path.exists(target):
+                os.remove(target)
             gp.check_result(gp.gp_file_save(camera_file, target))
+            self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
+
 
     def _capture_preview(self) -> bytes:
         with self.io_lock:
@@ -201,12 +207,22 @@ class DomainDGramPBCamera(PBCamera):
         """
         self.preview_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.preview_socket.bind("")
+        failcount = 0
         while True:
             image = self._capture_preview()
             try:
                 self.preview_socket.sendto(image, self.preview_file)
             except ConnectionRefusedError:
                 pass
+            except FileNotFoundError:
+                print(f"Failed to write to socket {self.preview_file}")
+                if os.path.exists(self.preview_file):
+                    print("It exists though...")
+                else:
+                    print("It really doesn't exist")
+                if failcount == 2:
+                    sys.exit(1)
+                failcount += 1
             time.sleep(0.05)
 
 def exec_server() -> None:

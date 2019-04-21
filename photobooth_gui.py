@@ -27,7 +27,7 @@ import os
 
 from typing import Union, Optional, List, Dict, Tuple
 
-from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint
+from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect
 from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
         QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout
@@ -52,6 +52,7 @@ class ImageRXThread(threading.Thread):
 
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.sock.bind(self.socket_name)
+        print(f"Opened preview socket {self.socket_name}")
 
         while True:
             data, addr = self.sock.recvfrom(1048576)
@@ -65,19 +66,32 @@ class SequenceThread(threading.Thread):
         self.window = window
 
     def run(self) -> None:
+        if os.path.exists("capture.sock"):
+            os.remove("capture.sock")
+        capture_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        capture_socket.bind("capture.sock")
+        capture_socket.settimeout(10)
+
         for i in range(3):
             for c in "321":
                 window.overlay.write(c)
                 time.sleep(1)
+            print(f"Sending capture message")
             control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             control_socket.bind("")
+
             control_socket.sendto(b"cmd", "control.sock")
+
+            data, addr = capture_socket.recvfrom(1048576)
+            img_path = str(data)
+            print(f"Got image at {img_path}")
             window.overlay.write("")
 
             time.sleep(3)
 
             del control_socket
             window.sequence_sem.release()
+        del capture_socket
 
 class QLabelClickable(QLabel):
     clicked=pyqtSignal()
@@ -90,17 +104,18 @@ class QLabelClickable(QLabel):
 class OverlayText(QLabelClickable):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.pixmap = QPixmap(600,600)
+        self.pixmap = QPixmap(300,300)
         self.pixmap.fill(Qt.transparent)
         mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
         self.painter = QPainter(self.pixmap)
+        self.myparent = parent
 
 
     def write(self, text:str) -> None:
         self.pixmap.fill(Qt.transparent)
         self.painter.setBackgroundMode(Qt.TransparentMode)
         self.painter.setFont(QFont("Arial",pointSize=140))
-        self.painter.drawText(QPoint(300,300), text)
+        self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignCenter, text)
 
         self.setPixmap(self.pixmap)
 
@@ -110,21 +125,24 @@ class CameraControlWindow(QMainWindow):
         super(CameraControlWindow, self).__init__(parent)
         self.setWindowTitle("Photobooth GUI")
 
-        self.imageWidget = QLabelClickable()
-        self.imageWidget.clicked.connect(self.handleClick)
-
-        # Create exit action
-        exitAction = QAction(QIcon('exit.png'), '&Exit', self)
-        exitAction.setShortcut('Ctrl+Q')
-        exitAction.setStatusTip('Exit application')
-        exitAction.triggered.connect(self.exitCall)
-
         # Create a widget for window contents
         wid = QWidget(self)
         self.setCentralWidget(wid)
 
-        self.overlay = OverlayText(self)
+        # Create exit action
+        exitAction = QAction(QIcon('exit.png'), '&Exit', wid)
+        exitAction.setShortcut('Ctrl+Q')
+        exitAction.setStatusTip('Exit application')
+        exitAction.triggered.connect(self.exitCall)
+
+        self.imageWidget = QLabelClickable(wid)
+        self.imageWidget.clicked.connect(self.handleClick)
+        self.imageWidget.setScaledContents(True)
+
+        self.overlay = OverlayText(wid)
         self.overlay.clicked.connect(self.handleClick)
+        self.overlay.setScaledContents(True)
+
 
 
         layout = QGridLayout()
