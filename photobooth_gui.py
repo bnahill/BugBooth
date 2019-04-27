@@ -31,7 +31,8 @@ from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect
 from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
         QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout
-from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QFont, QBitmap
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QFont, QBitmap, QBrush, QPen, QColor
+
 
 class ImageRXThread(threading.Thread):
     """ Listens to a domain socket waiting for images to come through.
@@ -60,6 +61,7 @@ class ImageRXThread(threading.Thread):
                 self.handler_fn(data)
             time.sleep(0.01)
 
+
 class SequenceThread(threading.Thread):
     def __init__(self, window:"CameraControlWindow") -> None:
         super().__init__()
@@ -72,10 +74,15 @@ class SequenceThread(threading.Thread):
         capture_socket.bind("capture.sock")
         capture_socket.settimeout(10)
 
-        for i in range(3):
+        image_files: List[str] = []
+
+        n_images = 3
+        for i in range(n_images):
+            topleft = f"{i+1}/{n_images}"
             for c in "321":
-                window.overlay.write(c)
+                self.window.overlay.write(c, topleft)
                 time.sleep(1)
+            self.window.overlay.write("", topleft)
             print(f"Sending capture message")
             control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             control_socket.bind("")
@@ -85,13 +92,17 @@ class SequenceThread(threading.Thread):
             data, addr = capture_socket.recvfrom(1048576)
             img_path = str(data)
             print(f"Got image at {img_path}")
-            window.overlay.write("")
+            image_files.append(img_path)
+            self.window.overlay.write("", topleft)
 
             time.sleep(3)
 
             del control_socket
-            window.sequence_sem.release()
+            self.window.sequence_sem.release()
+        self.window.overlay.write()
+        print(f"Photo set {image_files}")
         del capture_socket
+
 
 class QLabelClickable(QLabel):
     clicked=pyqtSignal()
@@ -101,23 +112,51 @@ class QLabelClickable(QLabel):
     def mousePressEvent(self, ev):
         self.clicked.emit()
 
+
 class OverlayText(QLabelClickable):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.pixmap = QPixmap(300,300)
+        self._w = int(3000/1.8)
+        self._h = int(2000/1.8)
+        self.pixmap = QPixmap(self._w, self._h)
         self.pixmap.fill(Qt.transparent)
-        mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
+        #mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
         self.painter = QPainter(self.pixmap)
         self.myparent = parent
 
+        # Go initialize it
+        self.write("")
 
-    def write(self, text:str) -> None:
+
+    def write(self, text:str="", topleft:str="") -> None:
         self.pixmap.fill(Qt.transparent)
         self.painter.setBackgroundMode(Qt.TransparentMode)
-        self.painter.setFont(QFont("Arial",pointSize=140))
-        self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignCenter, text)
+
+        if text:
+            self.painter.setPen(Qt.transparent)
+            self.painter.setBrush(QBrush(QColor("#80c4ccff")))
+
+            self.painter.drawEllipse(QPoint(int(self._w/2),int(self._h/2)), 150,150)
+            self.painter.setPen(Qt.black)
+            #self.painter.setBrush(QBrush(Qt.green));
+            self.painter.setFont(QFont("Arial",pointSize=140))
+            self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignCenter, text)
+
+        if topleft:
+            self.painter.setPen(Qt.black)
+            #self.painter.setBrush(QBrush(Qt.green));
+            self.painter.setFont(QFont("Arial",pointSize=100))
+            self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignTop | Qt.AlignLeft, topleft)
 
         self.setPixmap(self.pixmap)
+
+    def resizeEvent(self, event):
+        w = self.width()
+        h = self.height()
+        print(f"Resize event {w}x{h}")
+        newpix = self.pixmap.scaled(self.width(), self.height(), Qt.KeepAspectRatio)
+        self.setPixmap(newpix)
+        #self.pixmap = newpix
 
 
 class CameraControlWindow(QMainWindow):
@@ -143,16 +182,14 @@ class CameraControlWindow(QMainWindow):
         self.overlay.clicked.connect(self.handleClick)
         self.overlay.setScaledContents(True)
 
-
-
         layout = QGridLayout()
         layout.addWidget(self.imageWidget, 0, 0)
         layout.addWidget(self.overlay, 0, 0, Qt.AlignHCenter|Qt.AlignVCenter)
 
-
         # Set widget to contain window contents
         wid.setLayout(layout)
 
+        self.sequence_thread: Optional[SequenceThread] = None
         self.sequence_sem = threading.Semaphore(1)
 
         # Launch the RX thread
@@ -177,8 +214,9 @@ class CameraControlWindow(QMainWindow):
     def exitCall(self):
         sys.exit(app.exec_())
 
+
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = CameraControlWindow()
-    window.show()
-    sys.exit(app.exec_())
+    _app = QApplication(sys.argv)
+    _window = CameraControlWindow()
+    _window.showFullScreen()
+    sys.exit(_app.exec_())
