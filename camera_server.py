@@ -28,7 +28,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from typing import Union, Optional, List, Dict, Tuple
+from typing import Union, Optional, List, Dict, Tuple, Any, Callable
 
 import gphoto2 as gp
 
@@ -39,7 +39,7 @@ class PBCamera:
     out
     2. A streaming socket which constantly outputs an MJPEG preview from the camera
     """
-    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock") -> None:
+    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock", mock: bool=False) -> None:
         self.preview_thread = None
 
         self.control_sock_name = control_sock_name
@@ -50,7 +50,14 @@ class PBCamera:
 
         self.io_lock = threading.Lock()
 
-    def open(self):
+        self.camera_config = None
+        self.camera: Optional[Any] = None
+        self.old_capturetarget = None
+        self.camera_model = ""
+
+        self.mock = mock
+
+    def open(self) -> None:
         """ Open the preview and control sockets
         """
         try:
@@ -62,22 +69,31 @@ class PBCamera:
         self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.control_sock.bind(self.control_sock_name)
 
-        self.camera = gp.Camera()
-        self.camera.init()
-        camera_config = self.camera.get_config()
-        # get the camera model
-        OK, camera_model = gp.gp_widget_get_child_by_name(
-            camera_config, 'cameramodel')
-        if OK < gp.GP_OK:
-            OK, camera_model = gp.gp_widget_get_child_by_name(
-                camera_config, 'model')
-        if OK >= gp.GP_OK:
-            self.camera_model = camera_model.get_value()
-            print('Camera model:', self.camera_model)
+        if self.mock:
+            # I guess just do nothing...
+            pass
         else:
-            print('No camera model info')
+            self.camera = gp.Camera()
+            self.camera.init()
+            self.camera_config = self.camera.get_config()
+            # get the camera model
+            OK, camera_model = gp.gp_widget_get_child_by_name(
+                self.camera_config, 'cameramodel')
+            if OK < gp.GP_OK:
+                OK, camera_model = gp.gp_widget_get_child_by_name(
+                    self.camera_config, 'model')
+            if OK >= gp.GP_OK:
+                self.camera_model = camera_model.get_value()
+                print('Camera model:', self.camera_model)
+            else:
+                print('No camera model info')
 
+            OK, capture_target = gp.gp_widget_get_child_by_name(
+                self.camera_config, 'capturetarget')
 
+            if OK >= gp.GP_OK:
+                if self.old_capturetarget is None:
+                    self.old_capturetarget = capture_target.get_value()
 
     def close(self) -> None:
         """ Close all sockets and shut down
@@ -86,24 +102,30 @@ class PBCamera:
 
     def _capture_image(self) -> None:
         with self.io_lock:
-            print("Taking image")
-            file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
-            print("Took image")
-            print('Camera file path: {0}/{1}'.format(file_path.folder, file_path.name))
-            target = os.path.join('/tmp', file_path.name)
-            print('Copying image to', target)
-            camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
-            if os.path.exists(target):
-                os.remove(target)
-            gp.check_result(gp.gp_file_save(camera_file, target))
-            self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
-
+            if self.mock:
+                self.control_sock.sendto("mock_image.jpg".encode("UTF-8"), self.capture_sock_name)
+            else:
+                print("Taking image")
+                file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
+                print("Took image")
+                print('Camera file path: {0}/{1}'.format(file_path.folder, file_path.name))
+                target = os.path.join('/tmp', file_path.name)
+                print('Copying image to', target)
+                camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
+                if os.path.exists(target):
+                    os.remove(target)
+                gp.check_result(gp.gp_file_save(camera_file, target))
+                self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
 
     def _capture_preview(self) -> bytes:
         with self.io_lock:
-            camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
-            file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
-            file_bytes = memoryview(file_data)
+            if self.mock:
+                file_bytes = open("mock_preview.jpg", "rb").read()
+                time.sleep(0.05)
+            else:
+                camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
+                file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
+                file_bytes = memoryview(file_data)
         return file_bytes
 
     def _preview_thread_action(self) -> None:
@@ -131,13 +153,15 @@ class PBCamera:
         self.control_thread.join()
 
 class HTTPPBCamera(PBCamera):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, mock: bool=False) -> None:
+        super().__init__(mock=mock)
 
     def _preview_thread_action(self) -> None:
         """ Send data via an HTTP server
         """
         camera_self = self
+
+
         class PreviewHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
@@ -162,10 +186,10 @@ class HTTPPBCamera(PBCamera):
         return
 
 class DomainStreamPBCamera(PBCamera):
-    def __init__(self, preview_file:str="./preview.sock") -> None:
+    def __init__(self, preview_file:str="./preview.sock", mock: bool=False) -> None:
         self.preview_file = preview_file
         self.preview_socket:Optional[socket.socket] = None
-        super().__init__()
+        super().__init__(mock)
 
     def _preview_thread_action(self) -> None:
         """ Send data as MJPEG stream
@@ -196,11 +220,12 @@ class DomainStreamPBCamera(PBCamera):
                     print("Connection closed")
                     break
 
+
 class DomainDGramPBCamera(PBCamera):
-    def __init__(self, preview_file:str="./preview.sock") -> None:
-        self.preview_socket:Optional[socket.socket] = None
-        self.preview_file:str = preview_file
-        super().__init__()
+    def __init__(self, preview_file: str = "./preview.sock", mock: bool = False) -> None:
+        self.preview_socket: Optional[socket.socket] = None
+        self.preview_file: str = preview_file
+        super().__init__(mock=mock)
 
     def _preview_thread_action(self) -> None:
         """ Send data as a sequence of JPEG datagrams
@@ -225,13 +250,19 @@ class DomainDGramPBCamera(PBCamera):
                 failcount += 1
             time.sleep(0.05)
 
-def exec_server() -> None:
+
+def exec_server(mock: bool) -> None:
     """ Run the server
     """
-    camera = DomainDGramPBCamera()
+    camera = DomainDGramPBCamera(mock=mock)
     camera.open()
     camera.run()
 
+
 if __name__ == "__main__":
-    exec_server()
+    mock = False
+    if "--mock" in sys.argv:
+        mock = True
+
+    exec_server(mock)
     sys.exit(0)

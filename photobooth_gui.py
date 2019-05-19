@@ -25,26 +25,30 @@ import struct
 import threading
 import os
 
-from typing import Union, Optional, List, Dict, Tuple
+from PIL import Image
 
-from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect
+from typing import Union, Optional, List, Dict, Tuple, Callable
+
+from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect, QObject, pyqtSlot, pyqtSignal, QThread
 from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
         QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout
 from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QFont, QBitmap, QBrush, QPen, QColor
 
 
-class ImageRXThread(threading.Thread):
+class ImageReceiver(QObject):
     """ Listens to a domain socket waiting for images to come through.
     Then it calls the handler function (from its own thread).
     """
-    def __init__(self, socket_name, handler_fn):
+
+    img_received = pyqtSignal(object)
+
+    def __init__(self, socket_name: str) -> None:
         super().__init__()
         self.socket_name = socket_name
-        self.handler_fn = handler_fn
-        self.sock:Optional[socket.socket] = None
+        self.sock: Optional[socket.socket] = None
 
-    def run(self):
+    def run(self) -> None:
         try:
             os.unlink(self.socket_name)
         except OSError:
@@ -58,12 +62,44 @@ class ImageRXThread(threading.Thread):
         while True:
             data, addr = self.sock.recvfrom(1048576)
             if data:
-                self.handler_fn(data)
+                self.img_received.emit(data)
             time.sleep(0.01)
 
 
+class CompositeImage:
+    def __init__(self, photos: List[str], background: str):
+        self.photo_list = photos
+        self.background = background
+
+    def composite(self):
+        bg:Image = Image.open(self.background)
+        photos = [Image.open(img) for img in self.photo_list]
+
+        bg_w, bg_h = bg.size
+
+        img_w, img_h = photos[0].size
+        img_aspect = img_w/img_h
+
+        thumb_w = int(bg_w * 0.95)
+        thumb_h = int(thumb_w / img_aspect)
+
+        thumb_offset = int((bg_w - thumb_w) / 2)
+
+        for i, img in zip(range(len(photos)), photos):
+            print(f"BG: {bg_w}x{bg_h}")
+            print(f"Img: {img_w}x{img_h}")
+            print(f"Thumb: {thumb_w}x{thumb_h}")
+
+            p = img.copy()
+            p.thumbnail((thumb_w, thumb_h))
+            print(f"Thumb actual: {p.size}")
+
+            bg.paste(p, (thumb_offset, thumb_offset + int(1.2*thumb_h) * i))
+        return bg
+
+
 class SequenceThread(threading.Thread):
-    def __init__(self, window:"CameraControlWindow") -> None:
+    def __init__(self, window) -> None:
         super().__init__()
         self.window = window
 
@@ -90,7 +126,7 @@ class SequenceThread(threading.Thread):
             control_socket.sendto(b"cmd", "control.sock")
 
             data, addr = capture_socket.recvfrom(1048576)
-            img_path = str(data)
+            img_path = data.decode("UTF-8")
             print(f"Got image at {img_path}")
             image_files.append(img_path)
             self.window.overlay.write("", topleft)
@@ -101,11 +137,18 @@ class SequenceThread(threading.Thread):
             self.window.sequence_sem.release()
         self.window.overlay.write()
         print(f"Photo set {image_files}")
+
+        print("USING ABSOLUTE PATH FOR BACKGROUND")
+        bg_file = "/home/ben/Downloads/Background_1_color1.png"
+        c = CompositeImage(image_files, bg_file)
+        img = c.composite()
+        img.show()
         del capture_socket
 
 
 class QLabelClickable(QLabel):
-    clicked=pyqtSignal()
+    clicked = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -120,15 +163,14 @@ class OverlayText(QLabelClickable):
         self._h = int(2000/1.8)
         self.pixmap = QPixmap(self._w, self._h)
         self.pixmap.fill(Qt.transparent)
-        #mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
+        # mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
         self.painter = QPainter(self.pixmap)
         self.myparent = parent
 
         # Go initialize it
         self.write("")
 
-
-    def write(self, text:str="", topleft:str="") -> None:
+    def write(self, text: str = "", topleft: str = "") -> None:
         self.pixmap.fill(Qt.transparent)
         self.painter.setBackgroundMode(Qt.TransparentMode)
 
@@ -136,17 +178,17 @@ class OverlayText(QLabelClickable):
             self.painter.setPen(Qt.transparent)
             self.painter.setBrush(QBrush(QColor("#80c4ccff")))
 
-            self.painter.drawEllipse(QPoint(int(self._w/2),int(self._h/2)), 150,150)
+            self.painter.drawEllipse(QPoint(int(self._w/2), int(self._h/2)), 150, 150)
             self.painter.setPen(Qt.black)
-            #self.painter.setBrush(QBrush(Qt.green));
-            self.painter.setFont(QFont("Arial",pointSize=140))
-            self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignCenter, text)
+            # self.painter.setBrush(QBrush(Qt.green));
+            self.painter.setFont(QFont("Arial", pointSize=140))
+            self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignCenter, text)
 
         if topleft:
             self.painter.setPen(Qt.black)
-            #self.painter.setBrush(QBrush(Qt.green));
-            self.painter.setFont(QFont("Arial",pointSize=100))
-            self.painter.drawText(QRect(0,0,self.width(),self.height()), Qt.AlignTop | Qt.AlignLeft, topleft)
+            # self.painter.setBrush(QBrush(Qt.green));
+            self.painter.setFont(QFont("Arial", pointSize=100))
+            self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignTop | Qt.AlignLeft, topleft)
 
         self.setPixmap(self.pixmap)
 
@@ -156,7 +198,6 @@ class OverlayText(QLabelClickable):
         print(f"Resize event {w}x{h}")
         newpix = self.pixmap.scaled(self.width(), self.height(), Qt.KeepAspectRatio)
         self.setPixmap(newpix)
-        #self.pixmap = newpix
 
 
 class CameraControlWindow(QMainWindow):
@@ -193,10 +234,17 @@ class CameraControlWindow(QMainWindow):
         self.sequence_sem = threading.Semaphore(1)
 
         # Launch the RX thread
-        self.rx_thread = ImageRXThread("preview.sock", self.handleImage)
-        self.rx_thread.start()
+        self.receiver = ImageReceiver("preview.sock")
+        self.rx_thread = QThread(self)
 
-    def handleImage(self, image):
+        self.receiver.img_received.connect(self.handlePreview)
+        self.receiver.moveToThread(self.rx_thread)
+        self.rx_thread.started.connect(self.receiver.run)
+        self.rx_thread.start()
+        print("CONSTRUCTED")
+
+    @pyqtSlot(object)
+    def handlePreview(self, image):
         """ Callback to take an image (pile o' bytes) and update the display
         """
         q = QImage()
@@ -207,16 +255,22 @@ class CameraControlWindow(QMainWindow):
         if self.sequence_sem.acquire(blocking=False):
             self.sequence_thread = SequenceThread(self)
             self.sequence_thread.start()
-        #control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        #control_socket.bind("")
-        #control_socket.sendto(b"cmd", "control.sock")
+        # control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # control_socket.bind("")
+        # control_socket.sendto(b"cmd", "control.sock")
 
     def exitCall(self):
-        sys.exit(app.exec_())
+        sys.exit(1)
 
 
 if __name__ == '__main__':
+    fs = False
+    if "--fs" in sys.argv:
+        fs = True
     _app = QApplication(sys.argv)
     _window = CameraControlWindow()
-    _window.showFullScreen()
+    if fs:
+        _window.showFullScreen()
+    else:
+        _window.show()
     sys.exit(_app.exec_())
