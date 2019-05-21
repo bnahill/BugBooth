@@ -59,6 +59,8 @@ time.sleep(1)
 gui_cmd = f"./photobooth_gui.py --nimages {args.nimages}"
 if args.fs:
     gui_cmd += " --fs"
+if args.do_print:
+    gui_cmd += " --do_print"
 gui_proc = subprocess.Popen(gui_cmd, shell=True)
 
 try:

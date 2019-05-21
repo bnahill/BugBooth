@@ -24,6 +24,7 @@ import socket
 import struct
 import threading
 import os
+import subprocess
 
 from PIL import Image
 
@@ -65,17 +66,21 @@ class ImageReceiver(QObject):
                 self.img_received.emit(data)
             time.sleep(0.01)
 
-
 class CompositeImage:
     def __init__(self, photos: List[str], background: str):
         self.photo_list = photos
         self.background = background
+        self.bg_width:int = 0
+        self.bg_height: int = 0
+        self.composited_im = None
 
     def composite(self):
         bg:Image = Image.open(self.background)
         photos = [Image.open(img) for img in self.photo_list]
 
         bg_w, bg_h = bg.size
+        self.bg_width = bg_w
+        self.bg_height = bg_h
 
         img_w, img_h = photos[0].size
         img_aspect = img_w/img_h
@@ -95,13 +100,36 @@ class CompositeImage:
             print(f"Thumb actual: {p.size}")
 
             bg.paste(p, (thumb_offset, thumb_offset + int(1.2*thumb_h) * i))
+
+        self.composited_im = bg
         return bg
 
+    def width(self):
+        return self.bg_width
+
+    def height(self):
+        return self.bg_height
+
+    def make_printable(self):
+        margins = 30
+
+        if not self.composited_im:
+            return None
+
+        im = self.composited_im
+        im_w, im_h = im.size
+
+        concat = Image.new("RGB", (im_w * 2 + margins * 2, im_h + margins * 2))
+        concat.paste(im, (margins, margins))
+        concat.paste(im, (im_w + margins, margins))
+        concat.save("output.jpg")
+        return concat
 
 class SequenceThread(threading.Thread):
-    def __init__(self, window) -> None:
+    def __init__(self, window, do_print: bool = False) -> None:
         super().__init__()
         self.window = window
+        self.do_print = do_print
 
     def run(self) -> None:
         if os.path.exists("capture.sock"):
@@ -142,8 +170,15 @@ class SequenceThread(threading.Thread):
         bg_file = "/home/ben/Downloads/Background_1_color1.png"
         c = CompositeImage(image_files, bg_file)
         img = c.composite()
-        img.show()
+        #img.show()
+
+        concat = c.make_printable()
+        concat.save("output.jpg")
+
         del capture_socket
+
+        if self.do_print:
+            subprocess.run("lpr -P MITSUBISHI_CK60D70D707D output.jpg", shell=True)
 
 
 class QLabelClickable(QLabel):
@@ -201,9 +236,10 @@ class OverlayText(QLabelClickable):
 
 
 class CameraControlWindow(QMainWindow):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, do_print: bool = False):
         super(CameraControlWindow, self).__init__(parent)
         self.setWindowTitle("Photobooth GUI")
+        self.do_print = do_print
 
         # Create a widget for window contents
         wid = QWidget(self)
@@ -241,7 +277,6 @@ class CameraControlWindow(QMainWindow):
         self.receiver.moveToThread(self.rx_thread)
         self.rx_thread.started.connect(self.receiver.run)
         self.rx_thread.start()
-        print("CONSTRUCTED")
 
     @pyqtSlot(object)
     def handlePreview(self, image):
@@ -253,7 +288,7 @@ class CameraControlWindow(QMainWindow):
 
     def handleClick(self):
         if self.sequence_sem.acquire(blocking=False):
-            self.sequence_thread = SequenceThread(self)
+            self.sequence_thread = SequenceThread(self, self.do_print)
             self.sequence_thread.start()
         # control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         # control_socket.bind("")
@@ -264,12 +299,15 @@ class CameraControlWindow(QMainWindow):
 
 
 if __name__ == '__main__':
-    fs = False
+    _fs = False
     if "--fs" in sys.argv:
-        fs = True
+        _fs = True
+    _do_print = False
+    if "--do_print" in sys.argv:
+        _do_print = True
     _app = QApplication(sys.argv)
-    _window = CameraControlWindow()
-    if fs:
+    _window = CameraControlWindow(do_print=_do_print)
+    if _fs:
         _window.showFullScreen()
     else:
         _window.show()
