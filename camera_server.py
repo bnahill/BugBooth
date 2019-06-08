@@ -26,6 +26,7 @@ import socket
 import struct
 import threading
 import time
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from typing import Union, Optional, List, Dict, Tuple, Any, Callable
@@ -57,24 +58,19 @@ class PBCamera:
 
         self.mock = mock
 
-    def open(self) -> None:
-        """ Open the preview and control sockets
-        """
-        try:
-            os.unlink(self.control_sock_name)
-        except OSError:
-            if os.path.exists(self.control_sock_name):
-                raise
-
-        self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.control_sock.bind(self.control_sock_name)
-
+    def _open_camera(self):
         if self.mock:
             # I guess just do nothing...
             pass
         else:
-            self.camera = gp.Camera()
-            self.camera.init()
+            while True:
+                try:
+                    self.camera = gp.Camera()
+                    self.camera.init()
+                    break
+                except gp.GPhoto2Error:
+                    print("*** Error opening camera; retrying")
+                    time.sleep(1)
             self.camera_config = self.camera.get_config()
             # get the camera model
             OK, camera_model = gp.gp_widget_get_child_by_name(
@@ -95,6 +91,20 @@ class PBCamera:
                 if self.old_capturetarget is None:
                     self.old_capturetarget = capture_target.get_value()
 
+    def open(self) -> None:
+        """ Open the preview and control sockets
+        """
+        try:
+            os.unlink(self.control_sock_name)
+        except OSError:
+            if os.path.exists(self.control_sock_name):
+                raise
+
+        self.control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.control_sock.bind(self.control_sock_name)
+
+        self._open_camera()
+
     def close(self) -> None:
         """ Close all sockets and shut down
         """
@@ -106,16 +116,31 @@ class PBCamera:
                 self.control_sock.sendto("mock_image.jpg".encode("UTF-8"), self.capture_sock_name)
             else:
                 print("Taking image")
-                file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
+                while True:
+                    try:
+                        file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
+                        break
+                    except gp.GPhoto2Error:
+                        print("*** Error captuing; retrying")
+                        self._open_camera()
+                        time.sleep(0.1)
+
                 print("Took image")
                 print('Camera file path: {0}/{1}'.format(file_path.folder, file_path.name))
                 target = os.path.join('/tmp', file_path.name)
                 print('Copying image to', target)
                 camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
+
+                target = tempfile.mktemp(suffix=".jpg", dir=".")
                 if os.path.exists(target):
                     os.remove(target)
                 gp.check_result(gp.gp_file_save(camera_file, target))
-                self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
+
+                try:
+                    self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
+                except ConnectionRefusedError:
+                    print("Connection was refused")
+                self._open_camera()
 
     def _capture_preview(self) -> bytes:
         with self.io_lock:
@@ -123,7 +148,14 @@ class PBCamera:
                 file_bytes = open("mock_preview.jpg", "rb").read()
                 time.sleep(0.05)
             else:
-                camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
+                time.sleep(0.05)
+                while True:
+                    try:
+                        camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
+                        break
+                    except gp.GPhoto2Error:
+                        print("*** Error captuing preview; retrying")
+                        time.sleep(0.05)
                 file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
                 file_bytes = memoryview(file_data)
         return file_bytes

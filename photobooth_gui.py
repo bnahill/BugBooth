@@ -23,8 +23,10 @@ import time
 import socket
 import struct
 import threading
+import queue
 import os
 import subprocess
+import configparser
 
 from PIL import Image
 
@@ -32,9 +34,86 @@ from typing import Union, Optional, List, Dict, Tuple, Callable
 
 from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect, QObject, pyqtSlot, pyqtSignal, QThread
 from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
-        QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
-from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout
-from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QFont, QBitmap, QBrush, QPen, QColor
+        QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QBoxLayout)
+from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout, QSpacerItem
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QFont, QBitmap, QBrush, QPen, QColor, QMouseEvent
+
+IMAGE_T = Image.Image
+
+
+class BugBoothConfig:
+    CountdownTimer: int
+    DelayBetweenShots: int
+
+    PhotosPerStrip: int
+    BackgroundMode: str
+    BackgroundPath: str
+
+    Arrangement: str
+    Margins: Tuple[int, int, int, int]
+
+    def __init__(self, configfile: str = "bugbooth.conf"):
+        c = configparser.ConfigParser()
+        print(f"Reading configuration from {configfile}:")
+        c.read(configfile)
+
+        try:
+            self.CountdownTimer = int(c["GUI"]["CountdownTimer"])
+        except (KeyError, ValueError):
+            self.CountdownTimer = 3
+        print(f"  Countdown timer: {self.CountdownTimer}")
+
+        try:
+            self.DelayBetweenShots = int(c["GUI"]["DelayBetweenShots"])
+        except (KeyError, ValueError):
+            self.DelayBetweenShots = 3
+        print(f"  Delay between shots: {self.DelayBetweenShots}")
+
+        try:
+            self.PhotosPerStrip = int(c["Composition"]["PhotosPerStrip"])
+        except (KeyError, ValueError):
+            self.PhotosPerStrip = 4
+        print(f"  Photos per strip: {self.PhotosPerStrip}")
+
+        try:
+            self.BackgroundMode = str(c["Composition"]["BackgroundMode"])
+            if self.BackgroundMode not in ["Single", "Random"]:
+                print("Invalid background mode, falling back to single")
+                self.BackgroundMode = "Single"
+        except (KeyError, ValueError):
+            self.BackgroundMode = "Single"
+        assert self.BackgroundMode == "Single", "Only a single static background is supported at this time"
+        print(f"  Background mode: {self.BackgroundMode}")
+
+        try:
+            self.BackgroundPath = str(c["Composition"]["BackgroundPath"])
+            if self.BackgroundMode == "Single":
+                assert os.path.isfile(self.BackgroundPath), "BackgroundPath should be a file"
+            elif self.BackgroundMode == "Random":
+                assert os.path.isdir(self.BackgroundPath), "BackgroundPath should be a directory"
+        except (KeyError, ValueError):
+            assert False, "No BackgroundPath provided in configuration file"
+        print(f"  Background Ppth: {self.BackgroundPath}")
+
+        try:
+            self.Arrangement = str(c["Print"]["Arrangement"])
+            assert self.Arrangement == "2x2x6", "Currently only a pair of 2x6 strip may be generated"
+        except (KeyError, ValueError):
+            self.Arrangement = "2x2x6"
+        print(f"  Arrangement: {self.Arrangement}")
+
+        margins: List[int] = [0, 0, 0, 0]
+        for (i, key) in zip(range(4), ["MarginTop", "MarginRight", "MarginBottom", "MarginLeft"]):
+            try:
+                margins[i] = int(c["Print"][key])
+            except (KeyError, ValueError):
+                pass
+        self.Margins = tuple(margins)
+        print(f"  Print margins: {self.Margins}")
+
+
+# A global configuration available to all of the GUI
+boothconfig: Optional[BugBoothConfig] = None
 
 
 class ImageReceiver(QObject):
@@ -43,11 +122,13 @@ class ImageReceiver(QObject):
     """
 
     img_received = pyqtSignal(object)
+    socket_name: str
+    sock: Optional[socket.socket]
 
     def __init__(self, socket_name: str) -> None:
         super().__init__()
         self.socket_name = socket_name
-        self.sock: Optional[socket.socket] = None
+        self.sock = None
 
     def run(self) -> None:
         try:
@@ -66,16 +147,30 @@ class ImageReceiver(QObject):
                 self.img_received.emit(data)
             time.sleep(0.01)
 
-class CompositeImage:
+
+class Photostrip:
+    """
+    A class for a photostrip made of several images and a background
+    """
+    photos: List[str]
+    background: str
+    bg_width: int
+    bg_height: int
+    composited_im: Optional[IMAGE_T]
+
     def __init__(self, photos: List[str], background: str):
         self.photo_list = photos
         self.background = background
-        self.bg_width:int = 0
-        self.bg_height: int = 0
+        self.bg_width = 0
+        self.bg_height = 0
         self.composited_im = None
 
     def composite(self):
-        bg:Image = Image.open(self.background)
+        """
+        Add images to a background
+        :return: Composite image
+        """
+        bg: IMAGE_T = Image.open(self.background)
         photos = [Image.open(img) for img in self.photo_list]
 
         bg_w, bg_h = bg.size
@@ -111,25 +206,41 @@ class CompositeImage:
         return self.bg_height
 
     def make_printable(self):
-        margins = 30
+        """
+        Produce a 4x6 image
+        :return: 4x6 image
+        """
+        t_margin, r_margin, b_margin, l_margin = boothconfig.Margins
 
         if not self.composited_im:
-            return None
+            self.composite()
 
         im = self.composited_im
         im_w, im_h = im.size
 
-        concat = Image.new("RGB", (im_w * 2 + margins * 2, im_h + margins * 2))
-        concat.paste(im, (margins, margins))
-        concat.paste(im, (im_w + margins, margins))
+        concat: IMAGE_T = Image.new("RGB", (im_w * 2 + l_margin + r_margin, im_h + t_margin + b_margin))
+        concat.paste(im, (l_margin, t_margin))
+        concat.paste(im, (im_w + l_margin, t_margin))
         concat.save("output.jpg")
         return concat
 
+
 class SequenceThread(threading.Thread):
-    def __init__(self, window, do_print: bool = False) -> None:
+    click_queue: queue.Queue
+
+    def __init__(self, window, click_queue: queue.Queue, do_print: bool = False) -> None:
         super().__init__()
         self.window = window
         self.do_print = do_print
+        self.click_queue = click_queue
+
+    def _empty_click_queue(self):
+        while True:
+            # Empty the queue
+            try:
+                self.click_queue.get(block=False)
+            except queue.Empty:
+                break
 
     def run(self) -> None:
         if os.path.exists("capture.sock"):
@@ -140,10 +251,12 @@ class SequenceThread(threading.Thread):
 
         image_files: List[str] = []
 
-        n_images = 3
+        n_images = boothconfig.PhotosPerStrip
+        countdown_len = boothconfig.CountdownTimer
+        delay_between = boothconfig.DelayBetweenShots
         for i in range(n_images):
             topleft = f"{i+1}/{n_images}"
-            for c in "321":
+            for c in [str(x) for x in range(1, countdown_len + 1)[::-1]]:
                 self.window.overlay.write(c, topleft)
                 time.sleep(1)
             self.window.overlay.write("", topleft)
@@ -159,36 +272,63 @@ class SequenceThread(threading.Thread):
             image_files.append(img_path)
             self.window.overlay.write("", topleft)
 
-            time.sleep(3)
+            time.sleep(delay_between)
 
             del control_socket
-            self.window.sequence_sem.release()
-        self.window.overlay.write()
+
+        self.window.overlay.write(topleft="Processing...")
         print(f"Photo set {image_files}")
 
-        print("USING ABSOLUTE PATH FOR BACKGROUND")
-        bg_file = "/home/ben/Downloads/Background_1_color1.png"
-        c = CompositeImage(image_files, bg_file)
-        img = c.composite()
+        bg_file = boothconfig.BackgroundPath
+        photostrip = Photostrip(image_files, bg_file)
+        img = photostrip.composite()
         #img.show()
 
-        concat = c.make_printable()
+        concat = photostrip.make_printable()
         concat.save("output.jpg")
+        self.window.overlay.write()
 
-        del capture_socket
+        self._empty_click_queue()
+        ncopies = 2
+        timeleft = 20
+        #self.window.overlay.write(f"- {int(timeleft):02d} +", f"Copies: {ncopies}")
+
+        for i in range(200):
+            timeleft = int(20.0 -  20 * float(i) / 200)
+            self.window.overlay.write(f"- {ncopies} +", f"Copies?\n{timeleft:02d}s")
+            try:
+                x, y = self.click_queue.get(block=True, timeout=0.1)
+            except queue.Empty:
+                continue
+
+
+            # Okay we have a click!
+            print(f"Received {x},{y} click in sequence thread!")
+            if 0.3 < y < 0.7:
+                if x > 0.55:
+                    ncopies = min(ncopies + 2, 6)
+                elif x < 0.45:
+                    ncopies = max(ncopies - 2, 0)
+
+                self.window.overlay.write(f"- {ncopies} +", f"Copies?\n{timeleft:02d}s")
 
         if self.do_print:
-            subprocess.run("lpr -P MITSUBISHI_CK60D70D707D output.jpg", shell=True)
+            for i in range(ncopies >> 1):
+                subprocess.run("lpr -P MITSUBISHI_CK60D70D707D output.jpg", shell=True)
+
+        self.window.sequence_sem.release()
 
 
 class QLabelClickable(QLabel):
-    clicked = pyqtSignal()
+    clicked = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-    def mousePressEvent(self, ev):
-        self.clicked.emit()
+    def mousePressEvent(self, ev: QMouseEvent):
+        pos = ev.localPos()
+
+        self.clicked.emit(float(pos.x()) / self.width(), float(pos.y()) / self.height())
 
 
 class OverlayText(QLabelClickable):
@@ -216,13 +356,13 @@ class OverlayText(QLabelClickable):
             self.painter.drawEllipse(QPoint(int(self._w/2), int(self._h/2)), 150, 150)
             self.painter.setPen(Qt.black)
             # self.painter.setBrush(QBrush(Qt.green));
-            self.painter.setFont(QFont("Arial", pointSize=140))
+            self.painter.setFont(QFont("Consolas", pointSize=140))
             self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignCenter, text)
 
         if topleft:
             self.painter.setPen(Qt.black)
             # self.painter.setBrush(QBrush(Qt.green));
-            self.painter.setFont(QFont("Arial", pointSize=100))
+            self.painter.setFont(QFont("Consolas", pointSize=80))
             self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignTop | Qt.AlignLeft, topleft)
 
         self.setPixmap(self.pixmap)
@@ -235,14 +375,55 @@ class OverlayText(QLabelClickable):
         self.setPixmap(newpix)
 
 
+class FixedAspectRatioWidget(QWidget):
+    def __init__(self, widget: QWidget, ratio: float, parent=None):
+        super().__init__(parent)
+        self.aspect_ratio = ratio
+        # widget.size().width() / widget.size().height()
+        self.setLayout(QBoxLayout(QBoxLayout.LeftToRight, self))
+        #  add spacer, then widget, then spacer
+        self.layout().addItem(QSpacerItem(0, 0))
+        self.layout().addWidget(widget)
+        self.layout().addItem(QSpacerItem(0, 0))
+
+    def resizeEvent(self, e):
+        w = e.size().width()
+        h = e.size().height()
+
+        print(f"FixedAR resize to {w}x{h}")
+
+        if w / h > self.aspect_ratio:  # too wide
+            self.layout().setDirection(QBoxLayout.LeftToRight)
+            widget_stretch = h * self.aspect_ratio
+            outer_stretch = (w - widget_stretch) / 2 + 0.5
+        else:  # too tall
+            self.layout().setDirection(QBoxLayout.TopToBottom)
+            widget_stretch = w / self.aspect_ratio
+            outer_stretch = (h - widget_stretch) / 2 + 0.5
+
+        self.layout().setStretch(0, outer_stretch)
+        self.layout().setStretch(1, widget_stretch)
+        self.layout().setStretch(2, outer_stretch)
+
+
 class CameraControlWindow(QMainWindow):
+    click_queue: queue.Queue
+
     def __init__(self, parent=None, do_print: bool = False):
         super(CameraControlWindow, self).__init__(parent)
         self.setWindowTitle("Photobooth GUI")
         self.do_print = do_print
 
+        # Set background black
+        p = self.palette()
+        p.setColor(self.backgroundRole(), Qt.black)
+        self.setPalette(p)
+
         # Create a widget for window contents
-        wid = QWidget(self)
+        im_plus_overlay = QWidget(self)
+
+        # Wrap it in a thing that will force a fixed aspect ratio
+        wid = FixedAspectRatioWidget(im_plus_overlay, 1.5, self)
         self.setCentralWidget(wid)
 
         # Create exit action
@@ -251,6 +432,7 @@ class CameraControlWindow(QMainWindow):
         exitAction.setStatusTip('Exit application')
         exitAction.triggered.connect(self.exitCall)
 
+        self.click_queue = queue.Queue()
         self.imageWidget = QLabelClickable(wid)
         self.imageWidget.clicked.connect(self.handleClick)
         self.imageWidget.setScaledContents(True)
@@ -261,10 +443,10 @@ class CameraControlWindow(QMainWindow):
 
         layout = QGridLayout()
         layout.addWidget(self.imageWidget, 0, 0)
-        layout.addWidget(self.overlay, 0, 0, Qt.AlignHCenter|Qt.AlignVCenter)
+        layout.addWidget(self.overlay, 0, 0, Qt.AlignHCenter | Qt.AlignVCenter)
 
         # Set widget to contain window contents
-        wid.setLayout(layout)
+        im_plus_overlay.setLayout(layout)
 
         self.sequence_thread: Optional[SequenceThread] = None
         self.sequence_sem = threading.Semaphore(1)
@@ -286,15 +468,18 @@ class CameraControlWindow(QMainWindow):
         q.loadFromData(image)
         self.imageWidget.setPixmap(QPixmap(q))
 
-    def handleClick(self):
-        if self.sequence_sem.acquire(blocking=False):
-            self.sequence_thread = SequenceThread(self, self.do_print)
-            self.sequence_thread.start()
-        # control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        # control_socket.bind("")
-        # control_socket.sendto(b"cmd", "control.sock")
+    def handleClick(self, x: float, y: float):
+        print(f"Click location {x}, {y}")
 
-    def exitCall(self):
+        if self.sequence_sem.acquire(blocking=False):
+
+            self.sequence_thread = SequenceThread(self, click_queue=self.click_queue, do_print=self.do_print)
+            self.sequence_thread.start()
+        else:
+            self.click_queue.put((x, y))
+
+    @staticmethod
+    def exitCall():
         sys.exit(1)
 
 
@@ -305,6 +490,8 @@ if __name__ == '__main__':
     _do_print = False
     if "--do_print" in sys.argv:
         _do_print = True
+
+    boothconfig = BugBoothConfig()
     _app = QApplication(sys.argv)
     _window = CameraControlWindow(do_print=_do_print)
     if _fs:

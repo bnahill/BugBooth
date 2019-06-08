@@ -29,12 +29,13 @@ if __name__ != "__main__":
 
 
 def kill_old_servers():
-    completed_ps_process = subprocess.run("ps aux|grep python|grep camera_server.py", stdout=subprocess.PIPE, shell=True)
-    lines = completed_ps_process.stdout.decode("UTF-8").split("\n")
-    for l in lines[:-2]:
-        cols = [x for x in l.split(" ") if x]
-        print(cols)
-        subprocess.run(f"kill {cols[1]}", stdout=subprocess.PIPE, shell=True)
+    for grep in ["camera_server.py", "./photobooth_gui.py"]:
+        completed_ps_process = subprocess.run(f"ps aux|grep python|grep {grep}", stdout=subprocess.PIPE, shell=True)
+        lines = completed_ps_process.stdout.decode("UTF-8").split("\n")
+        for l in lines[:-2]:
+            cols = [x for x in l.split(" ") if x]
+            print(cols)
+            subprocess.run(f"kill {cols[1]}", stdout=subprocess.PIPE, shell=True)
 
 
 kill_old_servers()
