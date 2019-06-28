@@ -142,6 +142,8 @@ class PBCamera:
                     self.control_sock.sendto(target.encode("UTF-8"), self.capture_sock_name)
                 except ConnectionRefusedError:
                     print("Connection was refused")
+                except OSError:
+                    print("Failed to send--too big")
                 self._open_camera()
 
     def _capture_preview(self) -> bytes:
@@ -273,6 +275,8 @@ class DomainDGramPBCamera(PBCamera):
                 self.preview_socket.sendto(image, self.preview_file)
             except ConnectionRefusedError:
                 pass
+            except OSError:
+                print("Failed to send--too big")
             except FileNotFoundError:
                 print(f"Failed to write to socket {self.preview_file}")
                 if os.path.exists(self.preview_file):
