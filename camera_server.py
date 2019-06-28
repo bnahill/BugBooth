@@ -40,7 +40,8 @@ class PBCamera:
     out
     2. A streaming socket which constantly outputs an MJPEG preview from the camera
     """
-    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock", mock: bool=False) -> None:
+
+    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock", mock: bool = False) -> None:
         self.preview_thread = None
 
         self.control_sock_name = control_sock_name
@@ -129,9 +130,10 @@ class PBCamera:
                 print('Camera file path: {0}/{1}'.format(file_path.folder, file_path.name))
                 target = os.path.join('/tmp', file_path.name)
                 print('Copying image to', target)
-                camera_file = gp.check_result(gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
+                camera_file = gp.check_result(
+                    gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
 
-                target = tempfile.mktemp(suffix=".jpg", dir=".")
+                target = tempfile.mktemp(suffix=".jpg", dir="./output")
                 if os.path.exists(target):
                     os.remove(target)
                 gp.check_result(gp.gp_file_save(camera_file, target))
@@ -184,8 +186,9 @@ class PBCamera:
         self.preview_thread.join()
         self.control_thread.join()
 
+
 class HTTPPBCamera(PBCamera):
-    def __init__(self, mock: bool=False) -> None:
+    def __init__(self, mock: bool = False) -> None:
         super().__init__(mock=mock)
 
     def _preview_thread_action(self) -> None:
@@ -193,18 +196,17 @@ class HTTPPBCamera(PBCamera):
         """
         camera_self = self
 
-
         class PreviewHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
-                self.send_header('Content-type','multipart/x-mixed-replace; boundary=--jpgboundary')
+                self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=--jpgboundary')
                 self.end_headers()
                 while True:
                     try:
                         preview = camera_self._capture_preview()
                         self.wfile.write(b"--jpgboundary")
-                        self.send_header('Content-type','image/jpeg')
-                        #self.send_header('Content-length',str(len(preview)))
+                        self.send_header('Content-type', 'image/jpeg')
+                        # self.send_header('Content-length',str(len(preview)))
                         self.end_headers()
                         self.wfile.write(preview)
                         time.sleep(0.05)
@@ -213,15 +215,17 @@ class HTTPPBCamera(PBCamera):
                     except ConnectionResetError:
                         break
                 return
+
         server = HTTPServer(('localhost', 8080), PreviewHandler)
         server.serve_forever()
         return
 
+
 class DomainStreamPBCamera(PBCamera):
-    def __init__(self, preview_file:str="./preview.sock", mock: bool=False) -> None:
+    def __init__(self, preview_file: str = "./preview.sock", mock: bool = False) -> None:
         self.preview_file = preview_file
-        self.preview_socket:Optional[socket.socket] = None
-        super().__init__(mock)
+        self.preview_socket: Optional[socket.socket] = None
+        super().__init__(mock=mock)
 
     def _preview_thread_action(self) -> None:
         """ Send data as MJPEG stream
@@ -242,15 +246,13 @@ class DomainStreamPBCamera(PBCamera):
             connection, client_address = self.preview_socket.accept()
             print("Got connection")
             while True:
-                with self.io_lock:
-                    camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
-                    file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
-                    file_bytes = bytes(memoryview(file_data))
+                image = self._capture_preview()
                 try:
-                    connection.sendall(file_bytes)
+                    connection.sendall(len(image).to_bytes(4, "big") + image)
                 except BrokenPipeError:
                     print("Connection closed")
                     break
+                time.sleep(0.05)
 
 
 class DomainDGramPBCamera(PBCamera):
@@ -286,15 +288,15 @@ class DomainDGramPBCamera(PBCamera):
 def exec_server(mock: bool) -> None:
     """ Run the server
     """
-    camera = DomainDGramPBCamera(mock=mock)
+    camera = DomainStreamPBCamera(mock=mock)
     camera.open()
     camera.run()
 
 
 if __name__ == "__main__":
-    mock = False
+    _mock = False
     if "--mock" in sys.argv:
-        mock = True
+        _mock = True
 
-    exec_server(mock)
+    exec_server(_mock)
     sys.exit(0)

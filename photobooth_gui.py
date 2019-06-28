@@ -77,12 +77,12 @@ class BugBoothConfig:
 
         try:
             self.BackgroundMode = str(c["Composition"]["BackgroundMode"])
-            if self.BackgroundMode not in ["Single", "Random"]:
+            if self.BackgroundMode not in ["Single", "Random", "Double"]:
                 print("Invalid background mode, falling back to single")
                 self.BackgroundMode = "Single"
         except (KeyError, ValueError):
             self.BackgroundMode = "Single"
-        assert self.BackgroundMode == "Single", "Only a single static background is supported at this time"
+        assert self.BackgroundMode in ["Single", "Double"], "Only a single static background is supported at this time"
         print(f"  Background mode: {self.BackgroundMode}")
 
         try:
@@ -93,7 +93,7 @@ class BugBoothConfig:
                 assert os.path.isdir(self.BackgroundPath), "BackgroundPath should be a directory"
         except (KeyError, ValueError):
             assert False, "No BackgroundPath provided in configuration file"
-        print(f"  Background Ppth: {self.BackgroundPath}")
+        print(f"  Background Path: {self.BackgroundPath}")
 
         try:
             self.Arrangement = str(c["Print"]["Arrangement"])
@@ -131,6 +131,18 @@ class ImageReceiver(QObject):
         self.sock = None
 
     def run(self) -> None:
+        raise NotImplementedError()
+
+
+class ImageReceiverDGram(ImageReceiver):
+    """ Listens to a domain socket waiting for images to come through.
+    Then it calls the handler function (from its own thread).
+    """
+
+    def __init__(self, socket_name: str) -> None:
+        super().__init__(socket_name)
+
+    def run(self) -> None:
         try:
             os.unlink(self.socket_name)
         except OSError:
@@ -139,13 +151,48 @@ class ImageReceiver(QObject):
 
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.sock.bind(self.socket_name)
-        print(f"Opened preview socket {self.socket_name}")
+        print(f"Opened preview datagram socket {self.socket_name}")
 
         while True:
             data, addr = self.sock.recvfrom(1048576)
             if data:
                 self.img_received.emit(data)
             time.sleep(0.01)
+
+
+class ImageReceiverStream(ImageReceiver):
+    """ Listens to a domain socket waiting for images to come through.
+    Then it calls the handler function (from its own thread).
+    """
+
+    def __init__(self, socket_name: str) -> None:
+        super().__init__(socket_name)
+
+    def run(self) -> None:
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(self.socket_name)
+                print(f"Opened preview stream socket {self.socket_name}")
+            except FileNotFoundError:
+                print("Socket does not exist yet, waiting...")
+                time.sleep(2)
+                continue
+
+            while True:
+                preview_len_b = self.sock.recv(4)
+                if len(preview_len_b) != 4:
+                    continue
+
+                preview_len = int.from_bytes(preview_len_b, "big")
+
+                preview_data = self.sock.recv(preview_len)
+
+                if len(preview_data) != preview_len:
+                    continue
+
+                self.img_received.emit(preview_data)
+                time.sleep(0.01)
 
 
 class Photostrip:
@@ -158,12 +205,14 @@ class Photostrip:
     bg_height: int
     composited_im: Optional[IMAGE_T]
 
-    def __init__(self, photos: List[str], background: str):
+    def __init__(self, photos: List[str]):
         self.photo_list = photos
-        self.background = background
         self.bg_width = 0
         self.bg_height = 0
         self.composited_im = None
+
+        self.background = boothconfig.BackgroundPath
+        self.bg_mode = boothconfig.BackgroundMode
 
     def composite(self):
         """
@@ -180,21 +229,42 @@ class Photostrip:
         img_w, img_h = photos[0].size
         img_aspect = img_w/img_h
 
-        thumb_w = int(bg_w * 0.95)
-        thumb_h = int(thumb_w / img_aspect)
+        if self.bg_mode == "Single":
+            thumb_w = int(bg_w * 0.95)
+            thumb_h = int(thumb_w / img_aspect)
 
-        thumb_offset = int((bg_w - thumb_w) / 2)
+            thumb_offset = int((bg_w - thumb_w) / 2)
 
-        for i, img in zip(range(len(photos)), photos):
-            print(f"BG: {bg_w}x{bg_h}")
-            print(f"Img: {img_w}x{img_h}")
-            print(f"Thumb: {thumb_w}x{thumb_h}")
+            for i, img in zip(range(len(photos)), photos):
+                print(f"BG: {bg_w}x{bg_h}")
+                print(f"Img: {img_w}x{img_h}")
+                print(f"Thumb: {thumb_w}x{thumb_h}")
 
-            p = img.copy()
-            p.thumbnail((thumb_w, thumb_h))
-            print(f"Thumb actual: {p.size}")
+                p = img.copy()
+                p.thumbnail((thumb_w, thumb_h))
+                print(f"Thumb actual: {p.size}")
 
-            bg.paste(p, (thumb_offset, thumb_offset + int(1.2*thumb_h) * i))
+                bg.paste(p, (thumb_offset, thumb_offset + int(1.2*thumb_h) * i))
+        elif self.bg_mode == "Double":
+            print("Compositing on double background")
+            thumb_w = int(0.5 * bg_w * 0.81)
+            thumb_h = int(thumb_w / img_aspect)
+
+            top_offset = 9
+            thumb_offset = int(((bg_w / 2) - thumb_w) / 2)
+
+            for i, img in zip(range(len(photos)), photos):
+                print(f"BG: {bg_w}x{bg_h}")
+                print(f"Img: {img_w}x{img_h}")
+                print(f"Thumb: {thumb_w}x{thumb_h}")
+
+                p = img.copy()
+                p.thumbnail((thumb_w, thumb_h))
+                print(f"Thumb actual: {p.size}")
+
+                vscale = 1.098
+                bg.paste(p, (thumb_offset, top_offset + thumb_offset + int(vscale * thumb_h) * i))
+                bg.paste(p, (thumb_offset * 3 + thumb_w, top_offset + thumb_offset + int(vscale * thumb_h) * i))
 
         self.composited_im = bg
         return bg
@@ -218,9 +288,13 @@ class Photostrip:
         im = self.composited_im
         im_w, im_h = im.size
 
-        concat: IMAGE_T = Image.new("RGB", (im_w * 2 + l_margin + r_margin, im_h + t_margin + b_margin))
-        concat.paste(im, (l_margin, t_margin))
-        concat.paste(im, (im_w + l_margin, t_margin))
+        if self.bg_mode == "Single":
+            concat: IMAGE_T = Image.new("RGB", (im_w * 2 + l_margin + r_margin, im_h + t_margin + b_margin))
+            concat.paste(im, (l_margin, t_margin))
+            concat.paste(im, (im_w + l_margin, t_margin))
+        elif self.bg_mode == "Double":
+            concat: IMAGE_T = Image.new("RGB", (im_w + l_margin + r_margin, im_h + t_margin + b_margin))
+            concat.paste(im, (l_margin, t_margin))
         concat.save("output.jpg")
         return concat
 
@@ -279,10 +353,9 @@ class SequenceThread(threading.Thread):
         self.window.overlay.write(topleft="Processing...")
         print(f"Photo set {image_files}")
 
-        bg_file = boothconfig.BackgroundPath
-        photostrip = Photostrip(image_files, bg_file)
+        photostrip = Photostrip(image_files)
         img = photostrip.composite()
-        #img.show()
+        # img.show()
 
         concat = photostrip.make_printable()
         concat.save("output.jpg")
@@ -291,7 +364,7 @@ class SequenceThread(threading.Thread):
         self._empty_click_queue()
         ncopies = 2
         timeleft = 20
-        #self.window.overlay.write(f"- {int(timeleft):02d} +", f"Copies: {ncopies}")
+        # self.window.overlay.write(f"- {int(timeleft):02d} +", f"Copies: {ncopies}")
 
         for i in range(200):
             timeleft = int(20.0 -  20 * float(i) / 200)
@@ -301,7 +374,6 @@ class SequenceThread(threading.Thread):
             except queue.Empty:
                 continue
 
-
             # Okay we have a click!
             print(f"Received {x},{y} click in sequence thread!")
             if 0.3 < y < 0.7:
@@ -309,13 +381,23 @@ class SequenceThread(threading.Thread):
                     ncopies = min(ncopies + 2, 6)
                 elif x < 0.45:
                     ncopies = max(ncopies - 2, 0)
+                elif 0.45 < x < 0.55:
+                    self.window.overlay.write(f"", f"")
+                    break
 
                 self.window.overlay.write(f"- {ncopies} +", f"Copies?\n{timeleft:02d}s")
 
         if self.do_print:
-            for i in range(ncopies >> 1):
-                subprocess.run("lpr -P MITSUBISHI_CK60D70D707D output.jpg", shell=True)
+            if ncopies > 0:
+                self.window.overlay.write(f"", f"Printing...")
+                for i in range(ncopies >> 1):
+                    subprocess.run("lpr -P MITSUBISHI_CK60D70D707D output.jpg", shell=True)
+            time.sleep(5)
+        else:
+            self.window.overlay.write(f"", f"NoPrint")
+            time.sleep(5)
 
+        self.window.overlay.write(f"", f"Tap to start")
         self.window.sequence_sem.release()
 
 
@@ -409,10 +491,11 @@ class FixedAspectRatioWidget(QWidget):
 class CameraControlWindow(QMainWindow):
     click_queue: queue.Queue
 
-    def __init__(self, parent=None, do_print: bool = False):
+    def __init__(self, parent=None, do_print: bool = False, bg_mode: str = "Single"):
         super(CameraControlWindow, self).__init__(parent)
         self.setWindowTitle("Photobooth GUI")
         self.do_print = do_print
+        self.bg_mode = bg_mode
 
         # Set background black
         p = self.palette()
@@ -452,7 +535,7 @@ class CameraControlWindow(QMainWindow):
         self.sequence_sem = threading.Semaphore(1)
 
         # Launch the RX thread
-        self.receiver = ImageReceiver("preview.sock")
+        self.receiver = ImageReceiverStream("preview.sock")
         self.rx_thread = QThread(self)
 
         self.receiver.img_received.connect(self.handlePreview)
