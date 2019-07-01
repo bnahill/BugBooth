@@ -27,6 +27,7 @@ import struct
 import threading
 import time
 import tempfile
+import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from typing import Union, Optional, List, Dict, Tuple, Any, Callable
@@ -41,7 +42,8 @@ class PBCamera:
     2. A streaming socket which constantly outputs an MJPEG preview from the camera
     """
 
-    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock", mock: bool = False) -> None:
+    def __init__(self, control_sock_name="control.sock", capture_sock_name="capture.sock",
+                 preview_rate: int = 15, mock: bool = False) -> None:
         self.preview_thread = None
 
         self.control_sock_name = control_sock_name
@@ -58,6 +60,7 @@ class PBCamera:
         self.camera_model = ""
 
         self.mock = mock
+        self.preview_rate = preview_rate
 
     def _open_camera(self):
         if self.mock:
@@ -133,6 +136,8 @@ class PBCamera:
                 camera_file = gp.check_result(
                     gp.gp_camera_file_get(self.camera, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
 
+                if not os.path.isdir("./output"):
+                    os.mkdir("./output")
                 target = tempfile.mktemp(suffix=".jpg", dir="./output")
                 if os.path.exists(target):
                     os.remove(target)
@@ -150,16 +155,16 @@ class PBCamera:
         with self.io_lock:
             if self.mock:
                 file_bytes = open("mock_preview.jpg", "rb").read()
-                time.sleep(0.05)
+                time.sleep(1/self.preview_rate)
             else:
-                time.sleep(0.05)
+                time.sleep(1/self.preview_rate)
                 while True:
                     try:
                         camera_file = gp.check_result(gp.gp_camera_capture_preview(self.camera))
                         break
                     except gp.GPhoto2Error:
                         print("*** Error captuing preview; retrying")
-                        time.sleep(0.05)
+                        time.sleep(1/self.preview_rate)
                 file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
                 file_bytes = memoryview(file_data)
         return file_bytes
@@ -224,10 +229,10 @@ class HTTPPBCamera(PBCamera):
 
 
 class DomainStreamPBCamera(PBCamera):
-    def __init__(self, preview_file: str = "./preview.sock", mock: bool = False) -> None:
+    def __init__(self, preview_file: str = "./preview.sock", preview_rate: int = 15, mock: bool = False) -> None:
         self.preview_file = preview_file
         self.preview_socket: Optional[socket.socket] = None
-        super().__init__(mock=mock)
+        super().__init__(mock=mock, preview_rate=preview_rate)
 
     def _preview_thread_action(self) -> None:
         """ Send data as MJPEG stream
@@ -258,10 +263,10 @@ class DomainStreamPBCamera(PBCamera):
 
 
 class DomainDGramPBCamera(PBCamera):
-    def __init__(self, preview_file: str = "./preview.sock", mock: bool = False) -> None:
+    def __init__(self, preview_file: str = "./preview.sock", preview_rate: int = 15, mock: bool = False) -> None:
         self.preview_socket: Optional[socket.socket] = None
         self.preview_file: str = preview_file
-        super().__init__(mock=mock)
+        super().__init__(mock=mock, preview_rate=preview_rate)
 
     def _preview_thread_action(self) -> None:
         """ Send data as a sequence of JPEG datagrams
@@ -289,18 +294,20 @@ class DomainDGramPBCamera(PBCamera):
             time.sleep(0.05)
 
 
-def exec_server(mock: bool) -> None:
+def exec_server(mock: bool, preview_rate: int) -> None:
     """ Run the server
     """
-    camera = DomainStreamPBCamera(mock=mock)
+    camera = DomainStreamPBCamera(mock=mock, preview_rate=preview_rate)
     camera.open()
     camera.run()
 
 
 if __name__ == "__main__":
-    _mock = False
-    if "--mock" in sys.argv:
-        _mock = True
+    parser = argparse.ArgumentParser(description="Launch the camera server")
+    parser.add_argument("--mock", action="store_true", help="Just mock the input instead of using a camera")
+    parser.add_argument("--preview_rate", type=int, default=15, help="Maximum preview framerate")
 
-    exec_server(_mock)
+    args = parser.parse_args()
+
+    exec_server(mock=args.mock, preview_rate=args.preview_rate)
     sys.exit(0)

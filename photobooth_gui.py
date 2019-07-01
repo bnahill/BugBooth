@@ -27,6 +27,9 @@ import queue
 import os
 import subprocess
 import configparser
+import argparse
+import mimetypes
+import random
 
 from PIL import Image
 
@@ -47,10 +50,16 @@ class BugBoothConfig:
 
     PhotosPerStrip: int
     BackgroundMode: str
-    BackgroundPath: str
+    BackgroundPath: List[str]
 
     Arrangement: str
     Margins: Tuple[int, int, int, int]
+
+    ThumbnailWidth: int
+    ThumbnailX: int
+    ThumbnailY: int
+    ThumbnailSkipX: Optional[int]
+    ThumbnailSkipY: Optional[int]
 
     def __init__(self, configfile: str = "bugbooth.conf"):
         c = configparser.ConfigParser()
@@ -75,25 +84,51 @@ class BugBoothConfig:
             self.PhotosPerStrip = 4
         print(f"  Photos per strip: {self.PhotosPerStrip}")
 
+        valid_bg_modes = ["SingleVertical", "DoubleVertical"]
         try:
             self.BackgroundMode = str(c["Composition"]["BackgroundMode"])
-            if self.BackgroundMode not in ["Single", "Random", "Double"]:
-                print("Invalid background mode, falling back to single")
-                self.BackgroundMode = "Single"
+            if self.BackgroundMode not in valid_bg_modes:
+                print(f"Invalid background mode ({self.BackgroundMode}), falling back to single")
+                self.BackgroundMode = "SingleVertical"
         except (KeyError, ValueError):
-            self.BackgroundMode = "Single"
-        assert self.BackgroundMode in ["Single", "Double"], "Only a single static background is supported at this time"
+            self.BackgroundMode = "SingleVertical"
+        assert self.BackgroundMode in valid_bg_modes, "Only a single static background is supported at this time"
         print(f"  Background mode: {self.BackgroundMode}")
 
         try:
-            self.BackgroundPath = str(c["Composition"]["BackgroundPath"])
-            if self.BackgroundMode == "Single":
-                assert os.path.isfile(self.BackgroundPath), "BackgroundPath should be a file"
-            elif self.BackgroundMode == "Random":
-                assert os.path.isdir(self.BackgroundPath), "BackgroundPath should be a directory"
+            self.ThumbnailWidth = int(c["Composition"]["ThumbnailWidth"])
+            self.ThumbnailX = int(c["Composition"]["ThumbnailX"])
+            self.ThumbnailY = int(c["Composition"]["ThumbnailY"])
+        except (KeyError, ValueError):
+            assert False, "Please provide thumbnail width and x/y coordinates"
+
+        try:
+            self.ThumbnailSkipX = int(c["Composition"]["ThumbnailSkipX"])
+        except (KeyError, ValueError):
+            assert self.BackgroundMode == "SingleVertical", "Selected background mode requires a ThumbnailSkipX parameter"
+            self.ThumbnailSkipX = None
+
+        try:
+            self.ThumbnailSkipY = int(c["Composition"]["ThumbnailSkipY"])
+        except (KeyError, ValueError):
+            assert False, "Selected background mode requires a ThumbnailSkipY parameter"
+            self.ThumbnailSkipY = None
+
+        self.BackgroundPath = []
+        try:
+            bg_path = str(c["Composition"]["BackgroundPath"])
+            if os.path.isdir(bg_path):
+                self.BackgroundPath = os.listdir(bg_path)
+            elif os.path.isfile(bg_path):
+                self.BackgroundPath = [bg_path]
+
         except (KeyError, ValueError):
             assert False, "No BackgroundPath provided in configuration file"
-        print(f"  Background Path: {self.BackgroundPath}")
+
+        self.BackgroundPath = [f"{bg_path}/{x}" for x in self.BackgroundPath if self.path_is_img(x)]
+        assert len(self.BackgroundPath) != 0,"The provided BackgroundPath was not found to contain an image"
+
+        print(f"  Backgrounds: {self.BackgroundPath}")
 
         try:
             self.Arrangement = str(c["Print"]["Arrangement"])
@@ -110,6 +145,10 @@ class BugBoothConfig:
                 pass
         self.Margins = tuple(margins)
         print(f"  Print margins: {self.Margins}")
+
+    @staticmethod
+    def path_is_img(path):
+        return mimetypes.guess_type(path)[0].partition("/")[0] == "image"
 
 
 # A global configuration available to all of the GUI
@@ -174,14 +213,14 @@ class ImageReceiverStream(ImageReceiver):
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.sock.connect(self.socket_name)
                 print(f"Opened preview stream socket {self.socket_name}")
-            except FileNotFoundError:
+            except (FileNotFoundError, ConnectionRefusedError):
                 print("Socket does not exist yet, waiting...")
                 time.sleep(2)
                 continue
 
             while True:
                 preview_len_b = self.sock.recv(4)
-                if len(preview_len_b) != 4:
+                if len(preview_len_b) != 4 or len(preview_len_b) > 10000000:
                     continue
 
                 preview_len = int.from_bytes(preview_len_b, "big")
@@ -200,7 +239,7 @@ class Photostrip:
     A class for a photostrip made of several images and a background
     """
     photos: List[str]
-    background: str
+    background: List[str]
     bg_width: int
     bg_height: int
     composited_im: Optional[IMAGE_T]
@@ -219,7 +258,9 @@ class Photostrip:
         Add images to a background
         :return: Composite image
         """
-        bg: IMAGE_T = Image.open(self.background)
+
+
+        bg: IMAGE_T = Image.open(random.choice(self.background))
         photos = [Image.open(img) for img in self.photo_list]
 
         bg_w, bg_h = bg.size
@@ -229,11 +270,14 @@ class Photostrip:
         img_w, img_h = photos[0].size
         img_aspect = img_w/img_h
 
-        if self.bg_mode == "Single":
-            thumb_w = int(bg_w * 0.95)
+        if self.bg_mode == "SingleVerticaL":
+            thumb_w = boothconfig.ThumbnailWidth
             thumb_h = int(thumb_w / img_aspect)
 
-            thumb_offset = int((bg_w - thumb_w) / 2)
+            left_offset = boothconfig.ThumbnailX
+            top_offset = boothconfig.ThumbnailY
+            skip_x = boothconfig.ThumbnailSkipX
+            skip_y = boothconfig.ThumbnailSkipY
 
             for i, img in zip(range(len(photos)), photos):
                 print(f"BG: {bg_w}x{bg_h}")
@@ -244,14 +288,18 @@ class Photostrip:
                 p.thumbnail((thumb_w, thumb_h))
                 print(f"Thumb actual: {p.size}")
 
-                bg.paste(p, (thumb_offset, thumb_offset + int(1.2*thumb_h) * i))
-        elif self.bg_mode == "Double":
+                vpos = top_offset + (thumb_h + skip_y) * i
+                bg.paste(p, (left_offset, vpos))
+
+        elif self.bg_mode == "DoubleVertical":
             print("Compositing on double background")
-            thumb_w = int(0.5 * bg_w * 0.81)
+            thumb_w = boothconfig.ThumbnailWidth
             thumb_h = int(thumb_w / img_aspect)
 
-            top_offset = 9
-            thumb_offset = int(((bg_w / 2) - thumb_w) / 2)
+            left_offset = boothconfig.ThumbnailX
+            top_offset = boothconfig.ThumbnailY
+            skip_x = boothconfig.ThumbnailSkipX
+            skip_y = boothconfig.ThumbnailSkipY
 
             for i, img in zip(range(len(photos)), photos):
                 print(f"BG: {bg_w}x{bg_h}")
@@ -262,9 +310,11 @@ class Photostrip:
                 p.thumbnail((thumb_w, thumb_h))
                 print(f"Thumb actual: {p.size}")
 
-                vscale = 1.098
-                bg.paste(p, (thumb_offset, top_offset + thumb_offset + int(vscale * thumb_h) * i))
-                bg.paste(p, (thumb_offset * 3 + thumb_w, top_offset + thumb_offset + int(vscale * thumb_h) * i))
+                vpos = top_offset + (thumb_h + skip_y) * i
+                bg.paste(p, (left_offset, vpos))
+                bg.paste(p, (left_offset + skip_x + thumb_w, vpos))
+        else:
+            assert False, "Composite mode unknown"
 
         self.composited_im = bg
         return bg
@@ -288,13 +338,15 @@ class Photostrip:
         im = self.composited_im
         im_w, im_h = im.size
 
-        if self.bg_mode == "Single":
+        if self.bg_mode == "SingleVertical":
             concat: IMAGE_T = Image.new("RGB", (im_w * 2 + l_margin + r_margin, im_h + t_margin + b_margin))
             concat.paste(im, (l_margin, t_margin))
             concat.paste(im, (im_w + l_margin, t_margin))
-        elif self.bg_mode == "Double":
+        elif self.bg_mode == "DoubleVertical":
             concat: IMAGE_T = Image.new("RGB", (im_w + l_margin + r_margin, im_h + t_margin + b_margin))
             concat.paste(im, (l_margin, t_margin))
+        else:
+            concat = im
         concat.save("output.jpg")
         return concat
 
@@ -340,10 +392,14 @@ class SequenceThread(threading.Thread):
 
             control_socket.sendto(b"cmd", "control.sock")
 
-            data, addr = capture_socket.recvfrom(1048576)
-            img_path = data.decode("UTF-8")
-            print(f"Got image at {img_path}")
-            image_files.append(img_path)
+            try:
+                data, addr = capture_socket.recvfrom(1048576)
+                img_path = data.decode("UTF-8")
+                print(f"Got image at {img_path}")
+                image_files.append(img_path)
+            except socket.timeout:
+                pass
+
             self.window.overlay.write("", topleft)
 
             time.sleep(delay_between)
@@ -567,17 +623,17 @@ class CameraControlWindow(QMainWindow):
 
 
 if __name__ == '__main__':
-    _fs = False
-    if "--fs" in sys.argv:
-        _fs = True
-    _do_print = False
-    if "--do_print" in sys.argv:
-        _do_print = True
+    parser = argparse.ArgumentParser(description="Launch the BugBooth GUI")
+    parser.add_argument("--do_print", action="store_true", help="Actually print the compilations")
+    parser.add_argument("--fs", action="store_true", help="Display in full screen")
+    parser.add_argument("--config_file", type=str, default="bugbooth.conf")
 
-    boothconfig = BugBoothConfig()
+    args = parser.parse_args()
+
+    boothconfig = BugBoothConfig(args.config_file)
     _app = QApplication(sys.argv)
-    _window = CameraControlWindow(do_print=_do_print)
-    if _fs:
+    _window = CameraControlWindow(do_print=args.do_print)
+    if args.fs:
         _window.showFullScreen()
     else:
         _window.show()

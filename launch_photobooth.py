@@ -23,6 +23,7 @@ import subprocess
 import sys
 import argparse
 import time
+import configparser
 
 if __name__ != "__main__":
     sys.exit(1)
@@ -44,20 +45,28 @@ parser = argparse.ArgumentParser(description="Launch the BugBooth photobooth")
 parser.add_argument("--do_print", action="store_true", help="Actually print the compilations")
 parser.add_argument("--fs", action="store_true", help="Display in full screen")
 parser.add_argument("--mock", action="store_true", help="Use fake input data")
-parser.add_argument("--nimages", type=int, default=4, help="Number of images in a strip")
+parser.add_argument("--config_file", type=str, default="bugbooth.conf")
 
 args = parser.parse_args()
 
 print(f"FS: {args.fs}")
 print(f"Print: {args.do_print}")
 
+c = configparser.ConfigParser()
+c.read(args.config_file)
+
 server_cmd = "./camera_server.py"
 if args.mock:
     server_cmd += " --mock"
+try:
+    preview_rate = int(c["Capture"]["PreviewRate"])
+    server_cmd += f" --preview_rate {preview_rate}"
+except (KeyError, ValueError):
+    pass
 server_proc = subprocess.Popen(server_cmd, shell=True)
 
 time.sleep(1)
-gui_cmd = f"./photobooth_gui.py --nimages {args.nimages}"
+gui_cmd = f"./photobooth_gui.py --config_file {args.config_file}"
 if args.fs:
     gui_cmd += " --fs"
 if args.do_print:
