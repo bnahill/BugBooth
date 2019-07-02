@@ -61,7 +61,7 @@ class BugBoothConfig:
     ThumbnailSkipX: Optional[int]
     ThumbnailSkipY: Optional[int]
 
-    def __init__(self, configfile: str = "bugbooth.conf"):
+    def __init__(self, configfile: str = "bugbooth.conf") -> None:
         c = configparser.ConfigParser()
         print(f"Reading configuration from {configfile}:")
         c.read(configfile)
@@ -147,8 +147,11 @@ class BugBoothConfig:
         print(f"  Print margins: {self.Margins}")
 
     @staticmethod
-    def path_is_img(path):
-        return mimetypes.guess_type(path)[0].partition("/")[0] == "image"
+    def path_is_img(path: str) -> bool:
+        t: Tuple[Optional[str], Optional[str]] = mimetypes.guess_type(path)[0]
+        if not isinstance(t, str):
+            return False
+        return t.partition("/")[0] == "image"
 
 
 # A global configuration available to all of the GUI
