@@ -354,6 +354,22 @@ class Photostrip:
         return concat
 
 
+class OneshotTimer(threading.Timer):
+    """
+    A simple countdown timer which runs in its own thread
+    """
+    def __init__(self, t: float):
+        self.sem = threading.Semaphore(0)
+        super().__init__(t, self._finish)
+        self.start()
+
+    def _finish(self):
+        self.sem.release()
+
+    def wait(self):
+        self.sem.acquire(blocking=True)
+
+
 class SequenceThread(threading.Thread):
     click_queue: queue.Queue
 
@@ -389,11 +405,14 @@ class SequenceThread(threading.Thread):
                 self.window.overlay.write(c, topleft)
                 time.sleep(1)
             self.window.overlay.write("", topleft)
+
             print(f"Sending capture message")
             control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             control_socket.bind("")
 
             control_socket.sendto(b"cmd", "control.sock")
+
+            timer_before_next = OneshotTimer(delay_between)
 
             try:
                 data, addr = capture_socket.recvfrom(1048576)
@@ -405,7 +424,7 @@ class SequenceThread(threading.Thread):
 
             self.window.overlay.write("", topleft)
 
-            time.sleep(delay_between)
+            timer_before_next.wait()
 
             del control_socket
 
