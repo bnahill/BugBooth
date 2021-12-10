@@ -125,7 +125,7 @@ class PBCamera:
                         file_path = gp.check_result(gp.gp_camera_capture(self.camera, gp.GP_CAPTURE_IMAGE))
                         break
                     except gp.GPhoto2Error:
-                        print("*** Error captuing; retrying")
+                        print("*** Error capturing; retrying")
                         self._open_camera()
                         time.sleep(0.1)
 

@@ -35,7 +35,7 @@ from PIL import Image
 
 from typing import Union, Optional, List, Dict, Tuple, Callable
 
-from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect, QObject, pyqtSlot, pyqtSignal, QThread
+from PyQt5.QtCore import QDir, Qt, QUrl, QIODevice, pyqtSignal, QPoint, QRect, QSize, QObject, pyqtSlot, pyqtSignal, QThread
 from PyQt5.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
         QPushButton, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QBoxLayout)
 from PyQt5.QtWidgets import QMainWindow,QWidget, QPushButton, QAction, QGridLayout, QSpacerItem
@@ -494,19 +494,20 @@ class QLabelClickable(QLabel):
 class OverlayText(QLabelClickable):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._w = int(3000/1.8)
-        self._h = int(2000/1.8)
-        self.pixmap = QPixmap(self._w, self._h)
-        self.pixmap.fill(Qt.transparent)
-        # mask = self.pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
-        self.painter = QPainter(self.pixmap)
+        self._w = int(2000/1.4)
+        self._h = int(1500/1.4)
+        self._pixmap = QPixmap(self._w, self._h)
+        self._pixmap.fill(Qt.transparent)
+        # mask = self._pixmap.createMaskFromColor(Qt.black,Qt.MaskOutColor)
+        self.painter = QPainter(self._pixmap)
         self.myparent = parent
 
         # Go initialize it
         self.write("")
 
     def write(self, text: str = "", topleft: str = "") -> None:
-        self.pixmap.fill(Qt.transparent)
+
+        self._pixmap.fill(Qt.transparent)
         self.painter.setBackgroundMode(Qt.TransparentMode)
 
         if text:
@@ -517,34 +518,54 @@ class OverlayText(QLabelClickable):
             self.painter.setPen(Qt.black)
             # self.painter.setBrush(QBrush(Qt.green));
             self.painter.setFont(QFont("Consolas", pointSize=140))
-            self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignCenter, text)
+            self.painter.drawText(QRect(0, 0, self._w, self._h), Qt.AlignCenter, text)
 
         if topleft:
             self.painter.setPen(Qt.black)
             # self.painter.setBrush(QBrush(Qt.green));
             self.painter.setFont(QFont("Consolas", pointSize=80))
-            self.painter.drawText(QRect(0, 0, self.width(), self.height()), Qt.AlignTop | Qt.AlignLeft, topleft)
+            self.painter.drawText(QRect(0, 0, self._w, self._h), Qt.AlignTop | Qt.AlignLeft, topleft)
 
-        self.setPixmap(self.pixmap)
+        #self.setPixmap(self._pixmap.scaled(self._w, self._h, Qt.KeepAspectRatio))
+        self.setPixmap(self._pixmap)
 
     def resizeEvent(self, event):
         w = self.width()
         h = self.height()
-        print(f"Resize event {w}x{h}")
-        newpix = self.pixmap.scaled(self.width(), self.height(), Qt.KeepAspectRatio)
+        print(f"OverlayText resize event {w}x{h}")
+        newpix = QPixmap(self._pixmap.scaled(w, h, Qt.KeepAspectRatio))
+        self.old_pixmap = self._pixmap
+        self.painter.end()
+        self.painter = QPainter(newpix)
         self.setPixmap(newpix)
+        self._pixmap = newpix
+        self._w = w
+        self._h = h
 
 
 class FixedAspectRatioWidget(QWidget):
     def __init__(self, widget: QWidget, ratio: float, parent=None):
         super().__init__(parent)
+        self.central_widget = widget
         self.aspect_ratio = ratio
         # widget.size().width() / widget.size().height()
         self.setLayout(QBoxLayout(QBoxLayout.LeftToRight, self))
         #  add spacer, then widget, then spacer
-        self.layout().addItem(QSpacerItem(0, 0))
+        spc_l = QSpacerItem(0, 0)
+        spc_r = QSpacerItem(0, 0)
+        spc_l = QWidget(self)
+        spc_r = QWidget(self)
+
+        self.layout().addWidget(spc_l)
         self.layout().addWidget(widget)
-        self.layout().addItem(QSpacerItem(0, 0))
+        self.layout().addWidget(spc_r)
+        self.layout().setSpacing(0)
+
+        #self.setStyleSheet("background-color:black;")
+        spc_l.setStyleSheet("background-color:black;")
+        spc_r.setStyleSheet("background-color:black;")
+
+        self.also_resize = None
 
     def resizeEvent(self, e):
         w = e.size().width()
@@ -561,9 +582,13 @@ class FixedAspectRatioWidget(QWidget):
             widget_stretch = w / self.aspect_ratio
             outer_stretch = (h - widget_stretch) / 2 + 0.5
 
-        self.layout().setStretch(0, outer_stretch)
-        self.layout().setStretch(1, widget_stretch)
-        self.layout().setStretch(2, outer_stretch)
+        # No longer takes floats, so just add large multiplier so the proportions work out
+        self.layout().setStretch(0, int(outer_stretch*1000))
+        self.layout().setStretch(1, int(widget_stretch*1000))
+        self.layout().setStretch(2, int(outer_stretch*1000))
+
+        if self.also_resize:
+            self.also_resize.resize(self.central_widget.size())
 
 
 class CameraControlWindow(QMainWindow):
@@ -586,6 +611,7 @@ class CameraControlWindow(QMainWindow):
         # Wrap it in a thing that will force a fixed aspect ratio
         wid = FixedAspectRatioWidget(im_plus_overlay, 1.5, self)
         self.setCentralWidget(wid)
+        wid.layout().setContentsMargins(0, 0, 0, 0)
 
         # Create exit action
         exitAction = QAction(QIcon('exit.png'), '&Exit', wid)
@@ -600,11 +626,14 @@ class CameraControlWindow(QMainWindow):
 
         self.overlay = OverlayText(wid)
         self.overlay.clicked.connect(self.handleClick)
-        self.overlay.setScaledContents(True)
+        #self.overlay.setScaledContents(True)
+        wid.also_resize = self.overlay
 
         layout = QGridLayout()
         layout.addWidget(self.imageWidget, 0, 0)
         layout.addWidget(self.overlay, 0, 0, Qt.AlignHCenter | Qt.AlignVCenter)
+        # Remove extra spacing on the sides
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # Set widget to contain window contents
         im_plus_overlay.setLayout(layout)
@@ -656,6 +685,11 @@ if __name__ == '__main__':
     _app = QApplication(sys.argv)
     _window = CameraControlWindow(do_print=args.do_print)
     if args.fs:
+
+        # Try to resize to the screen size
+        screen = _app.desktop()
+        res = screen.availableGeometry()
+        _window.resize(res.size())
         _window.showFullScreen()
     else:
         _window.show()
